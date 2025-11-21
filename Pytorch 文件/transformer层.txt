@@ -1,0 +1,95 @@
+### Transformer 层到底是什么
+- 由“多头自注意力（MHA）+ 前馈网络（FFN）”两大块组成，之间配有“残差连接 + LayerNorm”。
+- 编码器层（EncoderLayer）结构：Self-Attention → Add&Norm → FFN → Add&Norm。
+- 解码器层（DecoderLayer）多一块“Masked Self-Attention”和“跨注意力（对编码器输出的注意力）”。
+
+### 自注意力的核心计算（单头）
+给定输入表示矩阵 X（形状 [N, S, d_model]，N=批大小，S=序列长度）：
+- 先线性映射得到 Q、K、V：Q = XW_Q，K = XW_K，V = XW_V（W 的形状分别是 \(d_{model}\times d_k\)、\(d_{model}\times d_k\)、\(d_{model}\times d_v\)）
+- 注意力权重：\( \text{Attn} = \text{softmax}(QK^\top / \sqrt{d_k}) \)
+- 输出：\( \text{Attn} \cdot V \)
+
+多头把 Q/K/V 按头数 h 切成 h 份并行计算，再拼接后接一个线性层 W_O。
+
+复杂度与内存：自注意力核心是 \(S\times S\) 的相关矩阵，时间/空间复杂度约为 \(O(S^2 d)\)。
+
+### 位置编码（Positional Encoding）
+- 解决序列位置信息：可用正弦/余弦位置编码或可学习的位置嵌入。
+- 正弦版（简述）：为每个位置 i、维度 2k/2k+1 注入 \(\sin(i/10000^{2k/d_{model}})\)、\(\cos(i/10000^{2k/d_{model}})\)。
+
+### 前馈网络（FFN）
+- 逐位置的两层全连接：`FFN(x) = Linear(d_model→d_ff) → 激活(GELU/ReLU) → Linear(d_ff→d_model)`。
+- `d_ff` 常是 `4*d_model`。
+
+### 残差与归一化
+- 每块后做 `x = x + SubLayer(x)` 残差，再做 `LayerNorm`。
+- 有两种顺序：Post-Norm（原始 Transformer）和 Pre-Norm（很多实现默认，训练更稳）。
+
+### 编码器 vs 解码器
+- 编码器层：只做自注意力（全可见）。
+- 解码器层：先做“Masked Self-Attention”（只看历史，保证自回归），再对编码器输出做“跨注意力”（允许看完整源序列），最后再 FFN。
+
+### PyTorch 常用 API（快速上手）
+- `nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=2048, dropout=0.1, batch_first=True, norm_first=True)`
+- `nn.TransformerEncoder(layer, num_layers)`
+- `nn.TransformerDecoderLayer(...)`、`nn.TransformerDecoder(...)`
+- `nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)`
+
+关键参数含义：
+- d_model: 特征维度（常见 256/512/768）
+- nhead: 注意力头数（需整除 d_model）
+- dim_feedforward: FFN 隐层维度（默认 2048）
+- dropout: 注意力/FFN/残差的丢弃率
+- batch_first: 若为 True，输入输出是 [N, S, d]；否则 [S, N, d]
+- norm_first: True 表示 Pre-Norm（更稳）
+
+### 掩码与填充
+- 注意力掩码 attn_mask（形状 [S, S] 或 [N*h, S, S]）：用于因果遮挡（上三角为 -inf）。
+- key_padding_mask（形状 [N, S]，布尔）：True 的位置不参与注意力（padding 位置）。
+
+### 最小可运行示例（编码器）
+```python
+import torch
+import torch.nn as nn
+
+N, S, d_model, nhead = 2, 5, 32, 4
+x = torch.randn(N, S, d_model)  # 输入序列表示
+padding_mask = torch.tensor([[False, False, False, True, True],
+                             [False, False, False, False, True]])  # [N,S]
+
+layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead,
+                                   dim_feedforward=128, dropout=0.1,
+                                   batch_first=True, norm_first=True)
+encoder = nn.TransformerEncoder(layer, num_layers=2)
+
+# 仅示例：无因果需求，不用 attn_mask；用 key_padding_mask 屏蔽 padding
+out = encoder(x, mask=None, src_key_padding_mask=padding_mask)
+print(out.shape)  # [N, S, d_model]
+```
+
+### 因果掩码（解码器/自回归）
+```python
+def generate_square_subsequent_mask(sz: int):
+    # 上三角设为 -inf，避免看见未来信息
+    mask = torch.full((sz, sz), float('-inf'))
+    mask = torch.triu(mask, diagonal=1)
+    return mask  # [S,S]
+
+S = 10
+tgt_mask = generate_square_subsequent_mask(S)  # 用在解码器的 masked self-attn
+```
+
+### 常见配置与经验
+- 头数与维度：`d_model % nhead == 0`，如 d_model=512, nhead=8。
+- 激活：GELU/SiLU 常优于 ReLU。
+- 归一化：Pre-Norm（norm_first=True）更稳。
+- 正则化：Dropout、Label Smoothing、权重衰减。
+- 训练技巧：梯度裁剪、学习率 warmup（如 4k 步）、混合精度（AMP）。
+- 长序列：注意力 O(S^2) 昂贵，可用因式注意力/稀疏注意力/滑窗注意力等改进。
+
+### 何时用编码器/解码器/Encoder-Decoder
+- 编码器-only（BERT）：理解/判别任务（分类、抽取）。
+- 解码器-only（GPT）：生成/自回归任务（语言建模、对话）。
+- 编码器-解码器（原始 Transformer）：序列到序列（翻译、摘要）。
+
+需要我结合你 `pytorch` 目录下的示例文件，写一段完整的最小 Transformer 编码器/解码器训练脚本吗？

@@ -1,0 +1,87 @@
+### 什么是 Dropout（直觉与原理）
+- **核心思想**：训练时以概率 p 将部分神经元输出置 0，并把未被置 0 的输出按系数 1/(1−p) 放大，打破隐式共适应，起到正则化、防止过拟合的作用。
+- **期望保持不变**：因为保留单元会除以 (1−p)，所以训练期输出的数学期望与不做 Dropout 时一致；推理期不再丢弃也不再缩放。
+
+### 数学形式（逐元素）
+- 训练期：y = mask ⊙ x / (1 − p)，其中 mask ~ Bernoulli(1 − p)
+- 推理期：y = x（即 eval 模式下禁用 Dropout）
+
+### 训练/推理的差异
+- 训练：启用随机丢弃与缩放（`model.train()`）。
+- 推理/验证：关闭 Dropout（`model.eval()`），输出确定性、一致。
+
+### 常用 API 与参数
+- `nn.Dropout(p=0.5, inplace=False)`
+  - **p**: 丢弃概率，0≤p<1。常用 0.1~0.5，CV 常见 0.3~0.5，NLP/Transformer 常见 0.1。
+  - **inplace**: 是否原地操作，一般用默认 False，除非明确需要省内存且确保计算图安全。
+- 变体：
+  - `nn.Dropout2d(p)`/`nn.Dropout3d(p)`: 按“通道维”整通道置 0，适合 CNN。
+  - `nn.AlphaDropout(p)`: 用于 SELU 激活，保持均值/方差不变性。
+  - `nn.FeatureAlphaDropout(p)`: AlphaDropout 的通道版。
+- 函数式对应：`F.dropout(x, p, training, inplace)`，通常直接用模块式即可。
+
+### 放置位置（经验）
+- 一般在“线性层或卷积层后、激活函数后”更常见，也有人放激活前，二者差异不大但以激活后更常见。
+- 与 BatchNorm 一起时，常见做法是 BN → 激活 → Dropout → 下一层（避免与 BN 的统计冲突）。
+- 在残差结构中，通常放在子层输出、残差相加之前或之后，按具体架构实现（如 Transformer 的子层 Dropout 在残差相加前）。
+
+### 在不同网络中的用法
+- CNN：
+  - 全连接前用 `nn.Dropout` 很常见；
+  - 特征图级稀疏可用 `nn.Dropout2d` 进行“通道丢弃”，增强鲁棒性。
+- RNN：
+  - `nn.LSTM/GRU` 的 `dropout` 参数只作用于“层与层之间的输出”，不是时间步内的单元；若想时间维共享同一 mask（variational dropout），需要自定义或用现成实现。
+- Transformer：
+  - 常见三个位置：注意力权重的 Dropout（softmax 后）、子层输出的 Dropout（MHA/FFN 后）、以及残差后的 Dropout/整体的 `dropout` 超参（如 `nn.TransformerEncoderLayer` 的 `dropout`）。
+
+### 如何选择 p
+- **小数据/过拟合明显**：p 较大（0.3~0.5）。
+- **大模型/大数据**：p 较小（0.1~0.3），或配合其他正则（权重衰减、数据增强）。
+- 若训练损失不收敛或收敛慢，尝试减小 p。
+
+### 常见坑
+- 忘记在验证/推理时 `model.eval()`，导致输出不稳定、指标偏低。
+- p 过大导致欠拟合；或在极浅网络上使用过强 Dropout。
+- 与 BatchNorm 叠放不当：尽量先 BN 再激活，再 Dropout。
+- 对小批量、浅层网络，单靠 Dropout 效果有限，可结合权重衰减、数据增强。
+
+### 小示例（对比 train/eval）
+```python
+import torch
+import torch.nn as nn
+
+torch.manual_seed(0)
+x = torch.ones(4, 4)
+
+drop = nn.Dropout(p=0.5)
+
+drop.train()
+y_train = drop(x)           # 随机一半为 0，其余除以(1-0.5)=2
+print('train:\n', y_train)
+
+drop.eval()
+y_eval = drop(x)            # 关闭 Dropout，等于 x 本身
+print('eval:\n', y_eval)
+```
+
+### 在模型中的典型用法
+```python
+import torch.nn as nn
+
+model = nn.Sequential(
+    nn.Conv2d(3, 64, 3, padding=1),
+    nn.ReLU(inplace=True),
+    nn.Dropout2d(p=0.3),
+    nn.Conv2d(64, 64, 3, padding=1),
+    nn.ReLU(inplace=True),
+    nn.MaxPool2d(2),
+
+    nn.Flatten(),
+    nn.Linear(64*16*16, 256),
+    nn.ReLU(inplace=True),
+    nn.Dropout(p=0.5),
+    nn.Linear(256, 10),
+)
+'''
+
+需要的话，我可以把你 `20nn_relu.py` 里的相关代码补充一个 Dropout 的可运行示例，展示 `train()/eval()` 下输出差异与对训练的影响。
